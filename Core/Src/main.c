@@ -153,6 +153,8 @@ int main(void)
 	  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
 	  HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_1);
 
+	  //kode adc baca sensor
+
 
   }
   /* USER CODE END 3 */
