@@ -40,10 +40,35 @@
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+ADC_HandleTypeDef hadc1;
 
 TIM_HandleTypeDef htim1;
 
 /* USER CODE BEGIN PV */
+
+#define ADC_MAX          4095.0f
+#define VREF             3.3f
+#define DIVIDER_RATIO    0.6667f
+
+#define SENSOR_V_MIN     0.5f
+#define SENSOR_V_MAX     4.5f
+
+// Pressure Range
+#define PRESSURE_MIN     0.0f
+#define PRESSURE_MAX     174.045285f   // 12 bar = 174.045285 psi
+
+#define ARR_VALUE    14399U      // 5 kHz @72 MHz
+#define DEAD_TIME    136U
+
+// Duty cycle masih manual/fixed
+float DutyCycle = 0.50f;
+
+uint32_t adc_raw = 0;
+uint32_t ccr     = 0;
+
+float v_after_divider = 0.0f;
+float v_sensor        = 0.0f;
+float pressure_psi    = 0.0f;
 
 //#define TIM_CLK_HZ   72000000UL
 //#define ARR_5KHZ     14399U
@@ -64,6 +89,7 @@ static void SystemPower_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_TIM1_Init(void);
 static void MX_ICACHE_Init(void);
+static void MX_ADC1_Init(void);
 /* USER CODE BEGIN PFP */
 
 
@@ -72,7 +98,7 @@ static void MX_ICACHE_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-float DutyCycle = 0.50;
+
 
 /* USER CODE END 0 */
 
@@ -110,14 +136,8 @@ int main(void)
   MX_GPIO_Init();
   MX_TIM1_Init();
   MX_ICACHE_Init();
+  MX_ADC1_Init();
   /* USER CODE BEGIN 2 */
-
-
-#define ARR_VALUE    14399                              // 5 kHz @ 72 MHz 50%
-#define DEAD_TIME    136
-
-
-
 //  TIM1->ARR = 10000;
 //  TIM1->CCR1 = 100;
 //  TIM1->CCR2 = 100;
@@ -141,9 +161,6 @@ int main(void)
 	  #define ACTIVE_DUTY  ((uint32_t)((ARR_VALUE + 1) * DutyCycle))  // 70% → CCR = 10080  ← DEFAULT
 	  // #define ACTIVE_DUTY  ((uint32_t)((ARR_VALUE + 1) * 0.80f))  // 80% → CCR = 11520
 	  // #define ACTIVE_DUTY  ((uint32_t)((ARR_VALUE + 1) * 0.90f))  // 90% → CCR = 12960
-	  if (DutyCycle > 1.0f){
-		  DutyCycle == 1.00;
-	  }
 
 	  // 1. Configure Timer Basics
 	  __HAL_TIM_SET_AUTORELOAD(&htim1, ARR_VALUE);
@@ -154,8 +171,67 @@ int main(void)
 	  HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_1);
 
 	  //kode adc baca sensor
+	  // ========================================================
+	      // PWM AC CHOPPER SECTION
+	      // ========================================================
+
+	      /*
+	       * DutyCycle bisa kamu ubah live nanti:
+	       *
+	       * DutyCycle = 0.3f;
+	       * DutyCycle = 0.7f;
+	       * dll
+	       */
+
+	      // Safety clamp
+	      if(DutyCycle < 0.0f)
+	          DutyCycle = 0.0f;
+
+	      if(DutyCycle > 0.95f)
+	          DutyCycle = 0.95f;
+
+	      // Convert duty → CCR
+	      ccr = (uint32_t)((ARR_VALUE + 1) * DutyCycle);
+
+	      // Update PWM
+	      __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, ccr);
 
 
+	      // ========================================================
+	      // ADC PRESSURE SENSOR SECTION
+	      // ========================================================
+
+	      HAL_ADC_Start(&hadc1);
+
+	      if(HAL_ADC_PollForConversion(&hadc1, 10) == HAL_OK)
+	      {
+	          adc_raw = HAL_ADC_GetValue(&hadc1);
+	      }
+
+	      HAL_ADC_Stop(&hadc1);
+
+	      // ADC → voltage after divider
+	      v_after_divider = ((float)adc_raw / ADC_MAX) * VREF;
+
+	      // Divider voltage → sensor voltage
+	      v_sensor = v_after_divider / DIVIDER_RATIO;
+
+	      // Sensor voltage → pressure
+	      pressure_psi = ((v_sensor - SENSOR_V_MIN) / (SENSOR_V_MAX - SENSOR_V_MIN)) * (PRESSURE_MAX - PRESSURE_MIN);
+
+	      // Clamp pressure
+	      if(pressure_psi < PRESSURE_MIN){
+	    	  pressure_psi = PRESSURE_MIN;
+	      }
+
+	      if(pressure_psi > PRESSURE_MAX){
+	    	  pressure_psi = PRESSURE_MAX;
+	      }
+	      // ========================================================
+	      // LOOP DELAY
+	      // ========================================================
+
+	      HAL_Delay(10);
   }
   /* USER CODE END 3 */
 }
@@ -229,6 +305,68 @@ static void SystemPower_Config(void)
   }
 /* USER CODE BEGIN PWR */
 /* USER CODE END PWR */
+}
+
+/**
+  * @brief ADC1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_ADC1_Init(void)
+{
+
+  /* USER CODE BEGIN ADC1_Init 0 */
+
+  /* USER CODE END ADC1_Init 0 */
+
+  ADC_ChannelConfTypeDef sConfig = {0};
+
+  /* USER CODE BEGIN ADC1_Init 1 */
+
+  /* USER CODE END ADC1_Init 1 */
+
+  /** Common config
+  */
+  hadc1.Instance = ADC1;
+  hadc1.Init.ClockPrescaler = ADC_CLOCK_ASYNC_DIV1;
+  hadc1.Init.Resolution = ADC_RESOLUTION_12B;
+  hadc1.Init.GainCompensation = 0;
+  hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+  hadc1.Init.ScanConvMode = ADC_SCAN_DISABLE;
+  hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
+  hadc1.Init.LowPowerAutoWait = DISABLE;
+  hadc1.Init.ContinuousConvMode = DISABLE;
+  hadc1.Init.NbrOfConversion = 1;
+  hadc1.Init.DiscontinuousConvMode = DISABLE;
+  hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+  hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
+  hadc1.Init.DMAContinuousRequests = DISABLE;
+  hadc1.Init.TriggerFrequencyMode = ADC_TRIGGER_FREQ_HIGH;
+  hadc1.Init.Overrun = ADC_OVR_DATA_PRESERVED;
+  hadc1.Init.LeftBitShift = ADC_LEFTBITSHIFT_NONE;
+  hadc1.Init.ConversionDataManagement = ADC_CONVERSIONDATA_DR;
+  hadc1.Init.OversamplingMode = DISABLE;
+  if (HAL_ADC_Init(&hadc1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Regular Channel
+  */
+  sConfig.Channel = ADC_CHANNEL_1;
+  sConfig.Rank = ADC_REGULAR_RANK_1;
+  sConfig.SamplingTime = ADC_SAMPLETIME_5CYCLE;
+  sConfig.SingleDiff = ADC_SINGLE_ENDED;
+  sConfig.OffsetNumber = ADC_OFFSET_NONE;
+  sConfig.Offset = 0;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN ADC1_Init 2 */
+
+  /* USER CODE END ADC1_Init 2 */
+
 }
 
 /**
