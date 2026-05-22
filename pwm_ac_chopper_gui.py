@@ -22,6 +22,13 @@ CSV_HEADER = [
     "duty_percent",
     "frequency_hz",
     "estimated_output_rms_v",
+    "jsy_online",
+    "jsy_voltage_rms_v",
+    "jsy_current_rms_a",
+    "jsy_active_power_w",
+    "jsy_power_factor",
+    "jsy_energy_kwh",
+    "jsy_error_count",
 ]
 
 
@@ -93,6 +100,13 @@ class App(tk.Tk):
             "duty": tk.StringVar(value="-"),
             "frequency": tk.StringVar(value="-"),
             "rms": tk.StringVar(value="-"),
+            "jsy_status": tk.StringVar(value="-"),
+            "jsy_voltage": tk.StringVar(value="-"),
+            "jsy_current": tk.StringVar(value="-"),
+            "jsy_power": tk.StringVar(value="-"),
+            "jsy_pf": tk.StringVar(value="-"),
+            "jsy_energy": tk.StringVar(value="-"),
+            "jsy_errors": tk.StringVar(value="-"),
         }
 
         self._build_ui()
@@ -139,6 +153,7 @@ class App(tk.Tk):
         ttk.Button(controls, text="Apply Frequency", command=self.apply_frequency).grid(row=1, column=3, padx=4)
         ttk.Button(controls, text="Apply Both", command=self.apply_both).grid(row=0, column=4, padx=4)
         ttk.Button(controls, text="Stop PWM", command=self.stop_pwm).grid(row=1, column=4, padx=4)
+        ttk.Button(controls, text="Scan JSY", command=self.scan_jsy).grid(row=0, column=5, padx=4)
         controls.columnconfigure(1, weight=1)
 
         telemetry = ttk.LabelFrame(outer, text="Telemetry", padding=10)
@@ -152,6 +167,13 @@ class App(tk.Tk):
             ("Duty", "duty"),
             ("Frequency", "frequency"),
             ("Est. Output RMS", "rms"),
+            ("JSY Status", "jsy_status"),
+            ("JSY Voltage", "jsy_voltage"),
+            ("JSY Current", "jsy_current"),
+            ("JSY Power", "jsy_power"),
+            ("Power Factor", "jsy_pf"),
+            ("Energy", "jsy_energy"),
+            ("JSY Errors", "jsy_errors"),
         ]
         for idx, (label, key) in enumerate(labels):
             row = idx // 4
@@ -213,6 +235,9 @@ class App(tk.Tk):
     def stop_pwm(self):
         self._send("STOP")
 
+    def scan_jsy(self):
+        self._send("SCANJSY")
+
     def _send(self, command):
         try:
             self.serial_worker.send(command)
@@ -264,7 +289,7 @@ class App(tk.Tk):
     def handle_line(self, line):
         self.append_log(line)
         parts = line.split(",")
-        if len(parts) != 9 or parts[0] != "DATA":
+        if len(parts) not in (9, 16) or parts[0] != "DATA":
             return
         try:
             has_float_payload = any("." in value for value in parts[3:9])
@@ -291,7 +316,26 @@ class App(tk.Tk):
                 "duty_percent": duty_percent,
                 "frequency_hz": int(parts[7]),
                 "estimated_output_rms_v": estimated_rms,
+                "jsy_online": 0,
+                "jsy_voltage_rms_v": 0.0,
+                "jsy_current_rms_a": 0.0,
+                "jsy_active_power_w": 0,
+                "jsy_power_factor": 0.0,
+                "jsy_energy_kwh": 0.0,
+                "jsy_error_count": 0,
             }
+            if len(parts) == 16:
+                row.update(
+                    {
+                        "jsy_online": int(parts[9]),
+                        "jsy_voltage_rms_v": int(parts[10]) / 100.0,
+                        "jsy_current_rms_a": int(parts[11]) / 1000.0,
+                        "jsy_active_power_w": int(parts[12]),
+                        "jsy_power_factor": int(parts[13]) / 1000.0,
+                        "jsy_energy_kwh": int(parts[14]) / 1000.0,
+                        "jsy_error_count": int(parts[15]),
+                    }
+                )
         except ValueError:
             self.status_var.set("DATA parse error")
             return
@@ -303,6 +347,13 @@ class App(tk.Tk):
         self.telemetry_vars["duty"].set(f'{row["duty_percent"]:.2f} %')
         self.telemetry_vars["frequency"].set(f'{row["frequency_hz"]} Hz')
         self.telemetry_vars["rms"].set(f'{row["estimated_output_rms_v"]:.2f} Vrms')
+        self.telemetry_vars["jsy_status"].set("Online" if row["jsy_online"] else "Offline")
+        self.telemetry_vars["jsy_voltage"].set(f'{row["jsy_voltage_rms_v"]:.2f} Vrms')
+        self.telemetry_vars["jsy_current"].set(f'{row["jsy_current_rms_a"]:.3f} Arms')
+        self.telemetry_vars["jsy_power"].set(f'{row["jsy_active_power_w"]} W')
+        self.telemetry_vars["jsy_pf"].set(f'{row["jsy_power_factor"]:.3f}')
+        self.telemetry_vars["jsy_energy"].set(f'{row["jsy_energy_kwh"]:.3f} kWh')
+        self.telemetry_vars["jsy_errors"].set(str(row["jsy_error_count"]))
 
         if self.csv_writer is not None:
             try:

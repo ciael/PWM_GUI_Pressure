@@ -47,6 +47,7 @@ ADC_HandleTypeDef hadc1;
 TIM_HandleTypeDef htim1;
 
 UART_HandleTypeDef huart1;
+UART_HandleTypeDef huart3;
 
 /* USER CODE BEGIN PV */
 #define ADC_MAX_COUNT          4095.0f
@@ -67,17 +68,39 @@ UART_HandleTypeDef huart1;
 #define DUTY_DEFAULT_PERCENT   50.0f
 
 #define TELEMETRY_PERIOD_MS    100U
+#define JSY_POLL_PERIOD_MS     1000U
+#define JSY_DEFAULT_ADDRESS    0x01U
+#define JSY_FUNC_READ_HOLDING  0x03U
+#define JSY_MEASURE_START_REG  0x0048U
+#define JSY_MEASURE_REG_COUNT  6U
+#define JSY_RESPONSE_SIZE      (5U + (JSY_MEASURE_REG_COUNT * 2U))
+#define JSY_ERR_OK             0U
+#define JSY_ERR_TX             1U
+#define JSY_ERR_RX_TIMEOUT     2U
+#define JSY_ERR_CRC            3U
+#define JSY_ERR_HEADER         4U
 #define UART_RX_BUFFER_SIZE    96U
-#define UART_TX_BUFFER_SIZE    160U
+#define UART_TX_BUFFER_SIZE    224U
 
 static uint32_t adc_raw = 0;
 static uint32_t send_tick = 0;
+static uint32_t jsy_poll_tick = 0;
+static uint32_t jsy_last_ok_tick = 0;
 static uint32_t pwm_freq_hz = PWM_DEFAULT_FREQ_HZ;
 static float duty_percent = DUTY_DEFAULT_PERCENT;
 static float adc_voltage = 0.0f;
 static float sensor_voltage = 0.0f;
 static float pressure_bar = 0.0f;
 static float estimated_output_rms = 0.0f;
+static float jsy_voltage_rms = 0.0f;
+static float jsy_current_rms = 0.0f;
+static float jsy_active_power = 0.0f;
+static float jsy_energy_kwh = 0.0f;
+static float jsy_power_factor = 0.0f;
+static uint8_t jsy_slave_address = JSY_DEFAULT_ADDRESS;
+static uint8_t jsy_online = 0;
+static uint8_t jsy_last_error = JSY_ERR_RX_TIMEOUT;
+static uint16_t jsy_error_count = 0;
 
 static uint8_t uart_rx_byte = 0;
 static char uart_rx_buffer[UART_RX_BUFFER_SIZE];
@@ -95,6 +118,7 @@ static void MX_TIM1_Init(void);
 static void MX_ICACHE_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_USART1_UART_Init(void);
+static void MX_USART3_UART_Init(void);
 /* USER CODE BEGIN PFP */
 int __io_putchar(int ch) {
 	HAL_UART_Transmit(&huart1, (uint8_t*) &ch, 1, 10);
@@ -106,6 +130,11 @@ static void ADC_ReadPressure(void);
 static void UART_StartReceiveIT(void);
 static void UART_ProcessCommand(const char *command);
 static void UART_SendTelemetry(void);
+static void JSY_ReadPeriodic(void);
+static uint8_t JSY_ReadMeasurements(void);
+static void JSY_SetBaudRate(uint32_t baudrate);
+static void JSY_ScanBus(void);
+static uint16_t Modbus_CRC16(const uint8_t *data, uint16_t length);
 static float clamp_float(float value, float min_value, float max_value);
 static uint32_t clamp_u32(uint32_t value, uint32_t min_value, uint32_t max_value);
 /* USER CODE END PFP */
@@ -151,6 +180,7 @@ int main(void)
   MX_ICACHE_Init();
   MX_ADC1_Init();
   MX_USART1_UART_Init();
+  MX_USART3_UART_Init();
   /* USER CODE BEGIN 2 */
 	PWM_Set(pwm_freq_hz, duty_percent);
 	HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
@@ -184,6 +214,7 @@ int main(void)
 		}
 
 		ADC_ReadPressure();
+		JSY_ReadPeriodic();
 
 		if ((HAL_GetTick() - send_tick) >= TELEMETRY_PERIOD_MS) {
 			send_tick = HAL_GetTick();
@@ -481,6 +512,54 @@ static void MX_USART1_UART_Init(void)
 }
 
 /**
+  * @brief USART3 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART3_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART3_Init 0 */
+
+  /* USER CODE END USART3_Init 0 */
+
+  /* USER CODE BEGIN USART3_Init 1 */
+
+  /* USER CODE END USART3_Init 1 */
+  huart3.Instance = USART3;
+  huart3.Init.BaudRate = 9600;
+  huart3.Init.WordLength = UART_WORDLENGTH_8B;
+  huart3.Init.StopBits = UART_STOPBITS_1;
+  huart3.Init.Parity = UART_PARITY_NONE;
+  huart3.Init.Mode = UART_MODE_TX_RX;
+  huart3.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart3.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart3.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  huart3.Init.ClockPrescaler = UART_PRESCALER_DIV1;
+  huart3.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  if (HAL_UART_Init(&huart3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetTxFifoThreshold(&huart3, UART_TXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetRxFifoThreshold(&huart3, UART_RXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_DisableFifoMode(&huart3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART3_Init 2 */
+
+  /* USER CODE END USART3_Init 2 */
+
+}
+
+/**
   * @brief GPIO Initialization Function
   * @param None
   * @retval None
@@ -494,6 +573,7 @@ static void MX_GPIO_Init(void)
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOC_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
@@ -561,6 +641,150 @@ static void ADC_ReadPressure(void) {
 	pressure_bar = clamp_float(pressure_bar, PRESSURE_BAR_MIN, PRESSURE_BAR_MAX);
 }
 
+static uint16_t Modbus_CRC16(const uint8_t *data, uint16_t length) {
+	uint16_t crc = 0xFFFFU;
+
+	for (uint16_t i = 0; i < length; i++) {
+		crc ^= data[i];
+		for (uint8_t bit = 0; bit < 8U; bit++) {
+			if ((crc & 0x0001U) != 0U) {
+				crc = (uint16_t) ((crc >> 1U) ^ 0xA001U);
+			} else {
+				crc >>= 1U;
+			}
+		}
+	}
+
+	return crc;
+}
+
+static void JSY_ReadPeriodic(void) {
+	if ((HAL_GetTick() - jsy_poll_tick) < JSY_POLL_PERIOD_MS) {
+		return;
+	}
+
+	jsy_poll_tick = HAL_GetTick();
+	if (JSY_ReadMeasurements()) {
+		jsy_online = 1;
+		jsy_last_ok_tick = HAL_GetTick();
+	} else {
+		jsy_online = 0;
+		if (jsy_error_count < UINT16_MAX) {
+			jsy_error_count++;
+		}
+	}
+}
+
+static void JSY_SetBaudRate(uint32_t baudrate) {
+	HAL_UART_Abort(&huart3);
+	HAL_UART_DeInit(&huart3);
+	huart3.Init.BaudRate = baudrate;
+	if (HAL_UART_Init(&huart3) != HAL_OK) {
+		Error_Handler();
+	}
+}
+
+static void JSY_ScanBus(void) {
+	const uint32_t baudrates[] = { 9600U, 4800U, 2400U, 1200U };
+	uint8_t original_address = jsy_slave_address;
+	uint32_t original_baudrate = huart3.Init.BaudRate;
+
+	jsy_poll_tick = HAL_GetTick();
+	HAL_UART_Abort(&huart3);
+	HAL_UART_Transmit(&huart1, (uint8_t*) "JSY_SCAN,START\r\n", 16U, 100U);
+
+	for (uint8_t b = 0; b < (sizeof(baudrates) / sizeof(baudrates[0])); b++) {
+		JSY_SetBaudRate(baudrates[b]);
+		HAL_Delay(20U);
+
+		for (uint8_t address = 1U; address <= 10U; address++) {
+			jsy_slave_address = address;
+			if (JSY_ReadMeasurements()) {
+				snprintf(uart_tx_buffer, sizeof(uart_tx_buffer),
+						"JSY_SCAN,FOUND,%lu,%u,%.2f,%.3f,%.3f\r\n",
+						(unsigned long) baudrates[b], (unsigned int) address,
+						jsy_voltage_rms, jsy_current_rms, jsy_power_factor);
+				HAL_UART_Transmit(&huart1, (uint8_t*) uart_tx_buffer,
+						strlen(uart_tx_buffer), 100U);
+				jsy_online = 1U;
+				jsy_last_ok_tick = HAL_GetTick();
+				jsy_poll_tick = HAL_GetTick();
+				return;
+			}
+		}
+	}
+
+	jsy_slave_address = original_address;
+	JSY_SetBaudRate(original_baudrate);
+	jsy_poll_tick = HAL_GetTick();
+	snprintf(uart_tx_buffer, sizeof(uart_tx_buffer), "JSY_SCAN,NOT_FOUND,%u\r\n",
+			(unsigned int) jsy_last_error);
+	HAL_UART_Transmit(&huart1, (uint8_t*) uart_tx_buffer,
+			strlen(uart_tx_buffer), 100U);
+}
+
+static uint8_t JSY_ReadMeasurements(void) {
+	uint8_t request[8];
+	uint8_t response[JSY_RESPONSE_SIZE];
+	uint8_t discard;
+
+	request[0] = jsy_slave_address;
+	request[1] = JSY_FUNC_READ_HOLDING;
+	request[2] = (uint8_t) (JSY_MEASURE_START_REG >> 8U);
+	request[3] = (uint8_t) (JSY_MEASURE_START_REG & 0xFFU);
+	request[4] = (uint8_t) (JSY_MEASURE_REG_COUNT >> 8U);
+	request[5] = (uint8_t) (JSY_MEASURE_REG_COUNT & 0xFFU);
+
+	uint16_t request_crc = Modbus_CRC16(request, 6U);
+	request[6] = (uint8_t) (request_crc & 0xFFU);
+	request[7] = (uint8_t) (request_crc >> 8U);
+
+	while (HAL_UART_Receive(&huart3, &discard, 1U, 2U) == HAL_OK) {
+	}
+
+	if (HAL_UART_Transmit(&huart3, request, sizeof(request), 200U) != HAL_OK) {
+		jsy_last_error = JSY_ERR_TX;
+		return 0;
+	}
+
+	if (HAL_UART_Receive(&huart3, response, sizeof(response), 250U) != HAL_OK) {
+		jsy_last_error = JSY_ERR_RX_TIMEOUT;
+		return 0;
+	}
+
+	uint16_t received_crc = (uint16_t) response[JSY_RESPONSE_SIZE - 2U]
+			| ((uint16_t) response[JSY_RESPONSE_SIZE - 1U] << 8U);
+	uint16_t calculated_crc = Modbus_CRC16(response, JSY_RESPONSE_SIZE - 2U);
+	if (received_crc != calculated_crc) {
+		jsy_last_error = JSY_ERR_CRC;
+		return 0;
+	}
+
+	if (response[0] != jsy_slave_address
+			|| response[1] != JSY_FUNC_READ_HOLDING
+			|| response[2] != (JSY_MEASURE_REG_COUNT * 2U)) {
+		jsy_last_error = JSY_ERR_HEADER;
+		return 0;
+	}
+
+	uint16_t regs[JSY_MEASURE_REG_COUNT];
+	for (uint8_t i = 0; i < JSY_MEASURE_REG_COUNT; i++) {
+		uint8_t offset = (uint8_t) (3U + (i * 2U));
+		regs[i] = (uint16_t) (((uint16_t) response[offset] << 8U)
+				| response[offset + 1U]);
+	}
+
+	jsy_voltage_rms = (float) regs[0] / 100.0f;
+	jsy_current_rms = (float) regs[1] / 1000.0f;
+	jsy_active_power = (float) regs[2];
+	jsy_energy_kwh = (float) (((uint32_t) regs[3] << 16U) | regs[4])
+			/ 3200.0f;
+	jsy_power_factor = (float) regs[5] / 1000.0f;
+	jsy_last_error = JSY_ERR_OK;
+
+	return 1;
+}
+
 static void UART_StartReceiveIT(void) {
 	HAL_UART_Receive_IT(&huart1, &uart_rx_byte, 1);
 }
@@ -577,6 +801,11 @@ static void UART_ProcessCommand(const char *command) {
 
 	if (strcmp(cmd, "GET") == 0) {
 		UART_SendTelemetry();
+		return;
+	}
+
+	if (strcmp(cmd, "SCANJSY") == 0) {
+		JSY_ScanBus();
 		return;
 	}
 
@@ -643,13 +872,22 @@ static void UART_SendTelemetry(void) {
 	uint32_t pressure_mbar = (uint32_t) ((pressure_bar * 1000.0f) + 0.5f);
 	uint32_t duty_centipercent = (uint32_t) ((duty_percent * 100.0f) + 0.5f);
 	uint32_t rms_centivolt = (uint32_t) ((estimated_output_rms * 100.0f) + 0.5f);
+	uint32_t jsy_voltage_centivolt = (uint32_t) ((jsy_voltage_rms * 100.0f) + 0.5f);
+	uint32_t jsy_current_milliamp = (uint32_t) ((jsy_current_rms * 1000.0f) + 0.5f);
+	uint32_t jsy_power_watt = (uint32_t) ((jsy_active_power) + 0.5f);
+	uint32_t jsy_power_factor_milli = (uint32_t) ((jsy_power_factor * 1000.0f) + 0.5f);
+	uint32_t jsy_energy_wh = (uint32_t) ((jsy_energy_kwh * 1000.0f) + 0.5f);
 
 	snprintf(uart_tx_buffer, sizeof(uart_tx_buffer),
-			"DATA,%lu,%u,%lu,%lu,%lu,%lu,%lu,%lu\r\n",
+			"DATA,%lu,%u,%lu,%lu,%lu,%lu,%lu,%lu,%u,%lu,%lu,%lu,%lu,%lu,%u\r\n",
 			(unsigned long) HAL_GetTick(), (unsigned int) adc_raw,
 			(unsigned long) adc_mv, (unsigned long) sensor_mv,
 			(unsigned long) pressure_mbar, (unsigned long) duty_centipercent,
-			(unsigned long) pwm_freq_hz, (unsigned long) rms_centivolt);
+			(unsigned long) pwm_freq_hz, (unsigned long) rms_centivolt,
+			(unsigned int) jsy_online, (unsigned long) jsy_voltage_centivolt,
+			(unsigned long) jsy_current_milliamp, (unsigned long) jsy_power_watt,
+			(unsigned long) jsy_power_factor_milli,
+			(unsigned long) jsy_energy_wh, (unsigned int) jsy_error_count);
 	HAL_UART_Transmit(&huart1, (uint8_t*) uart_tx_buffer,
 			strlen(uart_tx_buffer), 100);
 }
