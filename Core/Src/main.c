@@ -1,27 +1,29 @@
 /* USER CODE BEGIN Header */
 /**
-  ******************************************************************************
-  * @file           : main.c
-  * @brief          : Main program body
-  ******************************************************************************
-  * @attention
-  *
-  * Copyright (c) 2026 STMicroelectronics.
-  * All rights reserved.
-  *
-  * This software is licensed under terms that can be found in the LICENSE file
-  * in the root directory of this software component.
-  * If no LICENSE file comes with this software, it is provided AS-IS.
-  *
-  ******************************************************************************
-  */
+ ******************************************************************************
+ * @file           : main.c
+ * @brief          : Main program body
+ ******************************************************************************
+ * @attention
+ *
+ * Copyright (c) 2026 STMicroelectronics.
+ * All rights reserved.
+ *
+ * This software is licensed under terms that can be found in the LICENSE file
+ * in the root directory of this software component.
+ * If no LICENSE file comes with this software, it is provided AS-IS.
+ *
+ ******************************************************************************
+ */
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -44,43 +46,45 @@ ADC_HandleTypeDef hadc1;
 
 TIM_HandleTypeDef htim1;
 
+UART_HandleTypeDef huart1;
+
 /* USER CODE BEGIN PV */
+#define ADC_MAX_COUNT          4095.0f
+#define ADC_VREF               3.3f
+#define SENSOR_DIVIDER_RATIO   (20.0f / (9.79f + 20.0f))
+#define SENSOR_V_MIN           0.5f
+#define SENSOR_V_MAX           4.5f
+#define PRESSURE_BAR_MIN       0.0f
+#define PRESSURE_BAR_MAX       12.0f
+#define AC_INPUT_RMS           220.0f
 
-#define ADC_MAX          4095.0f
-#define VREF             3.3f
-#define DIVIDER_RATIO    0.6667f
+#define TIM1_CLK_HZ            72000000UL
+#define PWM_FREQ_MIN_HZ        100U
+#define PWM_FREQ_MAX_HZ        50000U
+#define PWM_DEFAULT_FREQ_HZ    5000U
+#define DUTY_MIN_PERCENT       0.0f
+#define DUTY_MAX_PERCENT       95.0f
+#define DUTY_DEFAULT_PERCENT   50.0f
 
-#define SENSOR_V_MIN     0.5f
-#define SENSOR_V_MAX     4.5f
+#define TELEMETRY_PERIOD_MS    100U
+#define UART_RX_BUFFER_SIZE    96U
+#define UART_TX_BUFFER_SIZE    160U
 
-// Pressure Range
-#define PRESSURE_MIN     0.0f
-#define PRESSURE_MAX     174.045285f   // 12 bar = 174.045285 psi
+static uint32_t adc_raw = 0;
+static uint32_t send_tick = 0;
+static uint32_t pwm_freq_hz = PWM_DEFAULT_FREQ_HZ;
+static float duty_percent = DUTY_DEFAULT_PERCENT;
+static float adc_voltage = 0.0f;
+static float sensor_voltage = 0.0f;
+static float pressure_bar = 0.0f;
+static float estimated_output_rms = 0.0f;
 
-#define ARR_VALUE    14399U      // 5 kHz @72 MHz
-#define DEAD_TIME    136U
-
-// Duty cycle masih manual/fixed
-float DutyCycle = 0.50f;
-
-uint32_t adc_raw = 0;
-uint32_t ccr     = 0;
-
-float v_after_divider = 0.0f;
-float v_sensor        = 0.0f;
-float pressure_psi    = 0.0f;
-
-//#define TIM_CLK_HZ   72000000UL
-//#define ARR_5KHZ     14399U
-//#define DEAD_TICKS   72U
-//
-//extern UART_HandleTypeDef huart4;   // ← tambahkan ini
-//
-//uint8_t  rx_byte;
-//char     rx_buf[16];
-//uint8_t  rx_idx = 0;
-uint32_t last_tick = 0;
-uint8_t counter = 0;
+static uint8_t uart_rx_byte = 0;
+static char uart_rx_buffer[UART_RX_BUFFER_SIZE];
+static uint16_t uart_rx_index = 0;
+static volatile uint8_t uart_command_ready = 0;
+static char uart_command_buffer[UART_RX_BUFFER_SIZE];
+static char uart_tx_buffer[UART_TX_BUFFER_SIZE];
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -90,15 +94,24 @@ static void MX_GPIO_Init(void);
 static void MX_TIM1_Init(void);
 static void MX_ICACHE_Init(void);
 static void MX_ADC1_Init(void);
+static void MX_USART1_UART_Init(void);
 /* USER CODE BEGIN PFP */
+int __io_putchar(int ch) {
+	HAL_UART_Transmit(&huart1, (uint8_t*) &ch, 1, 10);
+	return ch;
+}
 
-
-
+static void PWM_Set(uint32_t frequency_hz, float duty_pct);
+static void ADC_ReadPressure(void);
+static void UART_StartReceiveIT(void);
+static void UART_ProcessCommand(const char *command);
+static void UART_SendTelemetry(void);
+static float clamp_float(float value, float min_value, float max_value);
+static uint32_t clamp_u32(uint32_t value, uint32_t min_value, uint32_t max_value);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-
 
 /* USER CODE END 0 */
 
@@ -137,102 +150,48 @@ int main(void)
   MX_TIM1_Init();
   MX_ICACHE_Init();
   MX_ADC1_Init();
+  MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
-//  TIM1->ARR = 10000;
-//  TIM1->CCR1 = 100;
-//  TIM1->CCR2 = 100;
+	PWM_Set(pwm_freq_hz, duty_percent);
+	HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
+	HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_1);
 
+	HAL_ADCEx_Calibration_Start(&hadc1, ADC_CALIB_OFFSET, ADC_SINGLE_ENDED);
+	UART_StartReceiveIT();
+
+	HAL_Delay(500);
+	snprintf(uart_tx_buffer, sizeof(uart_tx_buffer),
+			"READY,PWM_AC_CHOPPER,%.1f,%lu\r\n", duty_percent,
+			(unsigned long) pwm_freq_hz);
+	HAL_UART_Transmit(&huart1, (uint8_t*) uart_tx_buffer,
+			strlen(uart_tx_buffer), 100);
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-  while (1)
-  {
+	while (1) {
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-	  // ── Duty Cycle — UNCOMMENT ONE ───────────────────────────────────────────────
-	  //
-	  // #define ACTIVE_DUTY  ((uint32_t)((ARR_VALUE + 1) * 0.20f))  // 20% → CCR = 2880
-	  // #define ACTIVE_DUTY  ((uint32_t)((ARR_VALUE + 1) * 0.30f))  // 30% → CCR = 4320
-	  //#define ACTIVE_DUTY  ((uint32_t)((ARR_VALUE + 1) * 0.40f))  // 40% → CCR = 5760
-	  //#define ACTIVE_DUTY  ((uint32_t)((ARR_VALUE + 1) * 0.50f))  // 50% → CCR = 7200
-	  //#define ACTIVE_DUTY  ((uint32_t)((ARR_VALUE + 1) * 0.60f))  // 60% → CCR = 8640
-	  #define ACTIVE_DUTY  ((uint32_t)((ARR_VALUE + 1) * DutyCycle))  // 70% → CCR = 10080  ← DEFAULT
-	  // #define ACTIVE_DUTY  ((uint32_t)((ARR_VALUE + 1) * 0.80f))  // 80% → CCR = 11520
-	  // #define ACTIVE_DUTY  ((uint32_t)((ARR_VALUE + 1) * 0.90f))  // 90% → CCR = 12960
+		if (uart_command_ready) {
+			__disable_irq();
+			char command[UART_RX_BUFFER_SIZE];
+			strncpy(command, uart_command_buffer, sizeof(command));
+			command[sizeof(command) - 1] = '\0';
+			uart_command_ready = 0;
+			__enable_irq();
+			UART_ProcessCommand(command);
+		}
 
-	  // 1. Configure Timer Basics
-	  __HAL_TIM_SET_AUTORELOAD(&htim1, ARR_VALUE);
-	  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, ACTIVE_DUTY);
+		ADC_ReadPressure();
 
-	  // 3. Start PWM for both channels
-	  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
-	  HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_1);
+		if ((HAL_GetTick() - send_tick) >= TELEMETRY_PERIOD_MS) {
+			send_tick = HAL_GetTick();
+			UART_SendTelemetry();
+		}
 
-	  //kode adc baca sensor
-	  // ========================================================
-	      // PWM AC CHOPPER SECTION
-	      // ========================================================
-
-	      /*
-	       * DutyCycle bisa kamu ubah live nanti:
-	       *
-	       * DutyCycle = 0.3f;
-	       * DutyCycle = 0.7f;
-	       * dll
-	       */
-
-	      // Safety clamp
-	      if(DutyCycle < 0.0f)
-	          DutyCycle = 0.0f;
-
-	      if(DutyCycle > 0.95f)
-	          DutyCycle = 0.95f;
-
-	      // Convert duty → CCR
-	      ccr = (uint32_t)((ARR_VALUE + 1) * DutyCycle);
-
-	      // Update PWM
-	      __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, ccr);
-
-
-	      // ========================================================
-	      // ADC PRESSURE SENSOR SECTION
-	      // ========================================================
-
-	      HAL_ADC_Start(&hadc1);
-
-	      if(HAL_ADC_PollForConversion(&hadc1, 10) == HAL_OK)
-	      {
-	          adc_raw = HAL_ADC_GetValue(&hadc1);
-	      }
-
-	      HAL_ADC_Stop(&hadc1);
-
-	      // ADC → voltage after divider
-	      v_after_divider = ((float)adc_raw / ADC_MAX) * VREF;
-
-	      // Divider voltage → sensor voltage
-	      v_sensor = v_after_divider / DIVIDER_RATIO;
-
-	      // Sensor voltage → pressure
-	      pressure_psi = ((v_sensor - SENSOR_V_MIN) / (SENSOR_V_MAX - SENSOR_V_MIN)) * (PRESSURE_MAX - PRESSURE_MIN);
-
-	      // Clamp pressure
-	      if(pressure_psi < PRESSURE_MIN){
-	    	  pressure_psi = PRESSURE_MIN;
-	      }
-
-	      if(pressure_psi > PRESSURE_MAX){
-	    	  pressure_psi = PRESSURE_MAX;
-	      }
-	      // ========================================================
-	      // LOOP DELAY
-	      // ========================================================
-
-	      HAL_Delay(10);
-  }
+		HAL_Delay(10);
+	}
   /* USER CODE END 3 */
 }
 
@@ -474,6 +433,54 @@ static void MX_TIM1_Init(void)
 }
 
 /**
+  * @brief USART1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART1_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART1_Init 0 */
+
+  /* USER CODE END USART1_Init 0 */
+
+  /* USER CODE BEGIN USART1_Init 1 */
+
+  /* USER CODE END USART1_Init 1 */
+  huart1.Instance = USART1;
+  huart1.Init.BaudRate = 115200;
+  huart1.Init.WordLength = UART_WORDLENGTH_8B;
+  huart1.Init.StopBits = UART_STOPBITS_1;
+  huart1.Init.Parity = UART_PARITY_NONE;
+  huart1.Init.Mode = UART_MODE_TX_RX;
+  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart1.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  huart1.Init.ClockPrescaler = UART_PRESCALER_DIV1;
+  huart1.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  if (HAL_UART_Init(&huart1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetTxFifoThreshold(&huart1, UART_TXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetRxFifoThreshold(&huart1, UART_RXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_DisableFifoMode(&huart1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART1_Init 2 */
+
+  /* USER CODE END USART1_Init 2 */
+
+}
+
+/**
   * @brief GPIO Initialization Function
   * @param None
   * @retval None
@@ -494,8 +501,178 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+static float clamp_float(float value, float min_value, float max_value) {
+	if (value < min_value) {
+		return min_value;
+	}
+	if (value > max_value) {
+		return max_value;
+	}
+	return value;
+}
 
+static uint32_t clamp_u32(uint32_t value, uint32_t min_value, uint32_t max_value) {
+	if (value < min_value) {
+		return min_value;
+	}
+	if (value > max_value) {
+		return max_value;
+	}
+	return value;
+}
 
+static void PWM_Set(uint32_t frequency_hz, float duty_pct) {
+	frequency_hz = clamp_u32(frequency_hz, PWM_FREQ_MIN_HZ, PWM_FREQ_MAX_HZ);
+	duty_pct = clamp_float(duty_pct, DUTY_MIN_PERCENT, DUTY_MAX_PERCENT);
+
+	uint32_t period = TIM1_CLK_HZ / frequency_hz;
+	if (period < 2U) {
+		period = 2U;
+	}
+	period -= 1U;
+
+	uint32_t compare = (uint32_t) (((float) (period + 1U) * duty_pct) / 100.0f);
+	if (compare > period) {
+		compare = period;
+	}
+
+	pwm_freq_hz = frequency_hz;
+	duty_percent = duty_pct;
+	estimated_output_rms = AC_INPUT_RMS * (duty_percent / 100.0f);
+
+	__HAL_TIM_DISABLE(&htim1);
+	__HAL_TIM_SET_AUTORELOAD(&htim1, period);
+	__HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, compare);
+	__HAL_TIM_SET_COUNTER(&htim1, 0);
+	__HAL_TIM_ENABLE(&htim1);
+}
+
+static void ADC_ReadPressure(void) {
+	HAL_ADC_Start(&hadc1);
+	if (HAL_ADC_PollForConversion(&hadc1, 10) == HAL_OK) {
+		adc_raw = HAL_ADC_GetValue(&hadc1);
+	}
+	HAL_ADC_Stop(&hadc1);
+
+	adc_voltage = ((float) adc_raw / ADC_MAX_COUNT) * ADC_VREF;
+	sensor_voltage = adc_voltage / SENSOR_DIVIDER_RATIO;
+	pressure_bar = ((sensor_voltage - SENSOR_V_MIN)
+			/ (SENSOR_V_MAX - SENSOR_V_MIN)) * PRESSURE_BAR_MAX;
+	pressure_bar = clamp_float(pressure_bar, PRESSURE_BAR_MIN, PRESSURE_BAR_MAX);
+}
+
+static void UART_StartReceiveIT(void) {
+	HAL_UART_Receive_IT(&huart1, &uart_rx_byte, 1);
+}
+
+static void UART_ProcessCommand(const char *command) {
+	char local[UART_RX_BUFFER_SIZE];
+	strncpy(local, command, sizeof(local));
+	local[sizeof(local) - 1] = '\0';
+
+	char *cmd = strtok(local, ", \t");
+	if (cmd == NULL) {
+		return;
+	}
+
+	if (strcmp(cmd, "GET") == 0) {
+		UART_SendTelemetry();
+		return;
+	}
+
+	if (strcmp(cmd, "STOP") == 0) {
+		PWM_Set(pwm_freq_hz, 0.0f);
+		HAL_UART_Transmit(&huart1, (uint8_t*) "OK,STOP\r\n", 9, 100);
+		return;
+	}
+
+	if (strcmp(cmd, "SET") != 0) {
+		HAL_UART_Transmit(&huart1, (uint8_t*) "ERR,UNKNOWN_CMD\r\n", 17, 100);
+		return;
+	}
+
+	char *field = strtok(NULL, ", \t");
+	char *value = strtok(NULL, ", \t");
+	if (field == NULL || value == NULL) {
+		HAL_UART_Transmit(&huart1, (uint8_t*) "ERR,BAD_FORMAT\r\n", 16, 100);
+		return;
+	}
+
+	if (strcmp(field, "DUTY") == 0) {
+		float new_duty = strtof(value, NULL);
+		PWM_Set(pwm_freq_hz, new_duty);
+		snprintf(uart_tx_buffer, sizeof(uart_tx_buffer), "OK,DUTY,%.2f\r\n",
+				duty_percent);
+		HAL_UART_Transmit(&huart1, (uint8_t*) uart_tx_buffer,
+				strlen(uart_tx_buffer), 100);
+		return;
+	}
+
+	if (strcmp(field, "FREQ") == 0) {
+		uint32_t new_freq = (uint32_t) strtoul(value, NULL, 10);
+		PWM_Set(new_freq, duty_percent);
+		snprintf(uart_tx_buffer, sizeof(uart_tx_buffer), "OK,FREQ,%lu\r\n",
+				(unsigned long) pwm_freq_hz);
+		HAL_UART_Transmit(&huart1, (uint8_t*) uart_tx_buffer,
+				strlen(uart_tx_buffer), 100);
+		return;
+	}
+
+	if (strcmp(field, "BOTH") == 0) {
+		char *freq_value = strtok(NULL, ", \t");
+		if (freq_value == NULL) {
+			HAL_UART_Transmit(&huart1, (uint8_t*) "ERR,BAD_FORMAT\r\n", 16, 100);
+			return;
+		}
+		float new_duty = strtof(value, NULL);
+		uint32_t new_freq = (uint32_t) strtoul(freq_value, NULL, 10);
+		PWM_Set(new_freq, new_duty);
+		snprintf(uart_tx_buffer, sizeof(uart_tx_buffer), "OK,BOTH,%.2f,%lu\r\n",
+				duty_percent, (unsigned long) pwm_freq_hz);
+		HAL_UART_Transmit(&huart1, (uint8_t*) uart_tx_buffer,
+				strlen(uart_tx_buffer), 100);
+		return;
+	}
+
+	HAL_UART_Transmit(&huart1, (uint8_t*) "ERR,UNKNOWN_FIELD\r\n", 19, 100);
+}
+
+static void UART_SendTelemetry(void) {
+	uint32_t adc_mv = (uint32_t) ((adc_voltage * 1000.0f) + 0.5f);
+	uint32_t sensor_mv = (uint32_t) ((sensor_voltage * 1000.0f) + 0.5f);
+	uint32_t pressure_mbar = (uint32_t) ((pressure_bar * 1000.0f) + 0.5f);
+	uint32_t duty_centipercent = (uint32_t) ((duty_percent * 100.0f) + 0.5f);
+	uint32_t rms_centivolt = (uint32_t) ((estimated_output_rms * 100.0f) + 0.5f);
+
+	snprintf(uart_tx_buffer, sizeof(uart_tx_buffer),
+			"DATA,%lu,%u,%lu,%lu,%lu,%lu,%lu,%lu\r\n",
+			(unsigned long) HAL_GetTick(), (unsigned int) adc_raw,
+			(unsigned long) adc_mv, (unsigned long) sensor_mv,
+			(unsigned long) pressure_mbar, (unsigned long) duty_centipercent,
+			(unsigned long) pwm_freq_hz, (unsigned long) rms_centivolt);
+	HAL_UART_Transmit(&huart1, (uint8_t*) uart_tx_buffer,
+			strlen(uart_tx_buffer), 100);
+}
+
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
+	if (huart->Instance == USART1) {
+		if (uart_rx_byte == '\n' || uart_rx_byte == '\r') {
+			if (uart_rx_index > 0) {
+				uart_rx_buffer[uart_rx_index] = '\0';
+				strncpy(uart_command_buffer, uart_rx_buffer,
+						sizeof(uart_command_buffer));
+				uart_command_buffer[sizeof(uart_command_buffer) - 1] = '\0';
+				uart_command_ready = 1;
+				uart_rx_index = 0;
+			}
+		} else if (uart_rx_index < (UART_RX_BUFFER_SIZE - 1U)) {
+			uart_rx_buffer[uart_rx_index++] = (char) uart_rx_byte;
+		} else {
+			uart_rx_index = 0;
+		}
+		HAL_UART_Receive_IT(&huart1, &uart_rx_byte, 1);
+	}
+}
 /* USER CODE END 4 */
 
 /**
@@ -505,11 +682,10 @@ static void MX_GPIO_Init(void)
 void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
-  /* User can add his own implementation to report the HAL error return state */
-  __disable_irq();
-  while (1)
-  {
-  }
+	/* User can add his own implementation to report the HAL error return state */
+	__disable_irq();
+	while (1) {
+	}
   /* USER CODE END Error_Handler_Debug */
 }
 #ifdef USE_FULL_ASSERT
