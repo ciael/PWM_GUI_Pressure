@@ -53,10 +53,13 @@ UART_HandleTypeDef huart3;
 #define ADC_MAX_COUNT          4095.0f
 #define ADC_VREF               3.3f
 #define SENSOR_DIVIDER_RATIO   (20.0f / (9.79f + 20.0f))
+#define SENSOR_VOLTAGE_CAL     0.9838f
 #define SENSOR_V_MIN           0.5f
 #define SENSOR_V_MAX           4.5f
 #define PRESSURE_BAR_MIN       0.0f
 #define PRESSURE_BAR_MAX       12.0f
+#define PRESSURE_FILTER_ALPHA  0.12f
+#define PRESSURE_DEADBAND_BAR  0.01f
 #define AC_INPUT_RMS           220.0f
 
 #define TIM1_CLK_HZ            72000000UL
@@ -91,6 +94,7 @@ static float duty_percent = DUTY_DEFAULT_PERCENT;
 static float adc_voltage = 0.0f;
 static float sensor_voltage = 0.0f;
 static float pressure_bar = 0.0f;
+static uint8_t pressure_filter_ready = 0;
 static float estimated_output_rms = 0.0f;
 static float jsy_voltage_rms = 0.0f;
 static float jsy_current_rms = 0.0f;
@@ -343,9 +347,9 @@ static void MX_ADC1_Init(void)
 
   /** Configure Regular Channel
   */
-  sConfig.Channel = ADC_CHANNEL_1;
+  sConfig.Channel = ADC_CHANNEL_2;
   sConfig.Rank = ADC_REGULAR_RANK_1;
-  sConfig.SamplingTime = ADC_SAMPLETIME_5CYCLE;
+  sConfig.SamplingTime = ADC_SAMPLETIME_68CYCLES;
   sConfig.SingleDiff = ADC_SINGLE_ENDED;
   sConfig.OffsetNumber = ADC_OFFSET_NONE;
   sConfig.Offset = 0;
@@ -442,7 +446,7 @@ static void MX_TIM1_Init(void)
   sBreakDeadTimeConfig.OffStateRunMode = TIM_OSSR_ENABLE;
   sBreakDeadTimeConfig.OffStateIDLEMode = TIM_OSSI_ENABLE;
   sBreakDeadTimeConfig.LockLevel = TIM_LOCKLEVEL_OFF;
-  sBreakDeadTimeConfig.DeadTime = 72;
+  sBreakDeadTimeConfig.DeadTime = 108;
   sBreakDeadTimeConfig.BreakState = TIM_BREAK_ENABLE;
   sBreakDeadTimeConfig.BreakPolarity = TIM_BREAKPOLARITY_HIGH;
   sBreakDeadTimeConfig.BreakFilter = 0;
@@ -635,9 +639,25 @@ static void ADC_ReadPressure(void) {
 	HAL_ADC_Stop(&hadc1);
 
 	adc_voltage = ((float) adc_raw / ADC_MAX_COUNT) * ADC_VREF;
-	sensor_voltage = adc_voltage / SENSOR_DIVIDER_RATIO;
-	pressure_bar = ((sensor_voltage - SENSOR_V_MIN)
+	float measured_sensor_voltage = (adc_voltage / SENSOR_DIVIDER_RATIO) * SENSOR_VOLTAGE_CAL;
+	float measured_pressure_bar = ((measured_sensor_voltage - SENSOR_V_MIN)
 			/ (SENSOR_V_MAX - SENSOR_V_MIN)) * PRESSURE_BAR_MAX;
+	measured_pressure_bar = clamp_float(measured_pressure_bar, PRESSURE_BAR_MIN, PRESSURE_BAR_MAX);
+
+	if (pressure_filter_ready == 0U) {
+		sensor_voltage = measured_sensor_voltage;
+		pressure_bar = measured_pressure_bar;
+		pressure_filter_ready = 1U;
+	} else {
+		sensor_voltage += PRESSURE_FILTER_ALPHA * (measured_sensor_voltage - sensor_voltage);
+
+		float pressure_delta = measured_pressure_bar - pressure_bar;
+		float abs_pressure_delta = (pressure_delta < 0.0f) ? -pressure_delta : pressure_delta;
+		if (abs_pressure_delta > PRESSURE_DEADBAND_BAR) {
+			pressure_bar += PRESSURE_FILTER_ALPHA * pressure_delta;
+		}
+	}
+
 	pressure_bar = clamp_float(pressure_bar, PRESSURE_BAR_MIN, PRESSURE_BAR_MAX);
 }
 

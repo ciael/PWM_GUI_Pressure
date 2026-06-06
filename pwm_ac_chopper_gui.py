@@ -2,6 +2,7 @@ import csv
 import queue
 import threading
 import time
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 import tkinter as tk
@@ -12,6 +13,8 @@ from serial.tools import list_ports
 
 
 BAUDRATE = 115200
+CSV_LOG_INTERVAL_SECONDS = 0.5
+SENSOR_MOVING_AVERAGE_SAMPLES = 15
 CSV_HEADER = [
     "pc_timestamp",
     "stm32_ms",
@@ -29,6 +32,9 @@ CSV_HEADER = [
     "jsy_power_factor",
     "jsy_energy_kwh",
     "jsy_error_count",
+    "valve_open_count",
+    "valve_state_label",
+    "valve_phase",
 ]
 
 
@@ -85,12 +91,22 @@ class App(tk.Tk):
         self.serial_worker = SerialWorker(self.line_queue)
         self.csv_file = None
         self.csv_writer = None
+        self.last_csv_log_time = 0.0
+        self.sensor_average_buffers = {
+            "adc_voltage_v": deque(maxlen=SENSOR_MOVING_AVERAGE_SAMPLES),
+            "sensor_voltage_v": deque(maxlen=SENSOR_MOVING_AVERAGE_SAMPLES),
+            "pressure_bar": deque(maxlen=SENSOR_MOVING_AVERAGE_SAMPLES),
+        }
 
         self.port_var = tk.StringVar()
         self.status_var = tk.StringVar(value="Disconnected")
         self.duty_var = tk.DoubleVar(value=50.0)
         self.freq_var = tk.IntVar(value=5000)
         self.csv_path_var = tk.StringVar(value=str(Path.cwd() / "pwm_ac_chopper_log.csv"))
+        self.valve_open_count = "-"
+        self.valve_state_label = "Belum ditandai"
+        self.valve_phase = "unset"
+        self.valve_marker_var = tk.StringVar(value="Keran: belum ditandai")
 
         self.telemetry_vars = {
             "adc_raw": tk.StringVar(value="-"),
@@ -141,20 +157,88 @@ class App(tk.Tk):
             command=lambda _: self._sync_duty_label(),
         )
         duty_scale.grid(row=0, column=1, padx=8, sticky="ew")
-        self.duty_label = ttk.Label(controls, width=8, text="50.0")
+        self.duty_label = ttk.Label(controls, width=8, text="50.00")
         self.duty_label.grid(row=0, column=2, sticky="w")
 
-        ttk.Label(controls, text="Frequency (Hz)").grid(row=1, column=0, sticky="w", pady=8)
+        duty_adjust = ttk.Frame(controls)
+        duty_adjust.grid(row=1, column=1, columnspan=2, padx=8, sticky="w")
+        ttk.Button(duty_adjust, text="-5", width=4, command=lambda: self.adjust_duty(-5.0)).pack(side="left", padx=2)
+        ttk.Button(duty_adjust, text="-1", width=4, command=lambda: self.adjust_duty(-1.0)).pack(side="left", padx=2)
+        ttk.Spinbox(
+            duty_adjust,
+            from_=0.0,
+            to=95.0,
+            increment=0.1,
+            textvariable=self.duty_var,
+            width=8,
+            format="%.2f",
+            command=self._sync_duty_label,
+        ).pack(side="left", padx=4)
+        ttk.Button(duty_adjust, text="+1", width=4, command=lambda: self.adjust_duty(1.0)).pack(side="left", padx=2)
+        ttk.Button(duty_adjust, text="+5", width=4, command=lambda: self.adjust_duty(5.0)).pack(side="left", padx=2)
+        ttk.Button(duty_adjust, text="20", width=4, command=lambda: self.set_duty_value(20.0)).pack(side="left", padx=(10, 2))
+        ttk.Button(duty_adjust, text="25", width=4, command=lambda: self.set_duty_value(25.0)).pack(side="left", padx=2)
+        ttk.Button(duty_adjust, text="50", width=4, command=lambda: self.set_duty_value(50.0)).pack(side="left", padx=2)
+        ttk.Button(duty_adjust, text="95", width=4, command=lambda: self.set_duty_value(95.0)).pack(side="left", padx=2)
+
+        ttk.Label(controls, text="Frequency (Hz)").grid(row=2, column=0, sticky="w", pady=8)
         ttk.Spinbox(controls, from_=100, to=50000, increment=100, textvariable=self.freq_var, width=12).grid(
-            row=1, column=1, padx=8, sticky="w"
+            row=2, column=1, padx=8, sticky="w"
         )
 
         ttk.Button(controls, text="Apply Duty", command=self.apply_duty).grid(row=0, column=3, padx=4)
-        ttk.Button(controls, text="Apply Frequency", command=self.apply_frequency).grid(row=1, column=3, padx=4)
+        ttk.Button(controls, text="Apply Frequency", command=self.apply_frequency).grid(row=2, column=3, padx=4)
         ttk.Button(controls, text="Apply Both", command=self.apply_both).grid(row=0, column=4, padx=4)
-        ttk.Button(controls, text="Stop PWM", command=self.stop_pwm).grid(row=1, column=4, padx=4)
+        ttk.Button(controls, text="Stop PWM", command=self.stop_pwm).grid(row=2, column=4, padx=4)
         ttk.Button(controls, text="Scan JSY", command=self.scan_jsy).grid(row=0, column=5, padx=4)
         controls.columnconfigure(1, weight=1)
+
+        valve = ttk.LabelFrame(outer, text="Valve / Keran Marker untuk CSV", padding=10)
+        valve.pack(fill="x", pady=(0, 10))
+        ttk.Label(valve, textvariable=self.valve_marker_var).grid(row=0, column=0, columnspan=5, sticky="w", pady=(0, 6))
+
+        stable_buttons = [
+            ("4", "4"),
+            ("3 1/2", "3.5"),
+            ("3", "3"),
+            ("2 1/2", "2.5"),
+            ("2", "2"),
+            ("1 1/2", "1.5"),
+            ("1", "1"),
+            ("1/2", "0.5"),
+            ("0", "0"),
+        ]
+        for idx, (label, value) in enumerate(stable_buttons):
+            row = 1 + (idx // 5)
+            col = idx % 5
+            ttk.Button(
+                valve,
+                text=f"{label} keran stabil",
+                command=lambda v=value, l=label: self.set_valve_marker(v, "stable", l),
+            ).grid(row=row, column=col, padx=3, pady=2, sticky="ew")
+
+        ttk.Button(
+            valve,
+            text="Transisi tutup 4->0",
+            command=lambda: self.set_valve_marker("4->0", "transition_close"),
+        ).grid(row=3, column=0, columnspan=2, padx=3, pady=2, sticky="ew")
+        ttk.Button(
+            valve,
+            text="Transisi buka 0->4",
+            command=lambda: self.set_valve_marker("0->4", "transition_open"),
+        ).grid(row=3, column=2, columnspan=2, padx=3, pady=2, sticky="ew")
+        ttk.Button(
+            valve,
+            text="Transisi manual",
+            command=lambda: self.set_valve_marker("manual", "transition_manual"),
+        ).grid(row=4, column=0, columnspan=2, padx=3, pady=2, sticky="ew")
+        ttk.Button(
+            valve,
+            text="Reset marker",
+            command=self.reset_valve_marker,
+        ).grid(row=4, column=2, columnspan=2, padx=3, pady=2, sticky="ew")
+        for col in range(5):
+            valve.columnconfigure(col, weight=1)
 
         telemetry = ttk.LabelFrame(outer, text="Telemetry", padding=10)
         telemetry.pack(fill="x")
@@ -197,7 +281,39 @@ class App(tk.Tk):
         self.log_text.pack(fill="both", expand=True)
 
     def _sync_duty_label(self):
-        self.duty_label.configure(text=f"{self.duty_var.get():.1f}")
+        self.set_duty_value(self.duty_var.get(), update_log=False)
+
+    def set_duty_value(self, value, update_log=True):
+        duty = max(0.0, min(95.0, round(float(value), 2)))
+        self.duty_var.set(duty)
+        self.duty_label.configure(text=f"{duty:.2f}")
+        if update_log:
+            self.append_log(f"# Duty set on GUI: {duty:.2f}%")
+
+    def adjust_duty(self, delta):
+        self.set_duty_value(self.duty_var.get() + delta)
+
+    def set_valve_marker(self, value, phase, label=None):
+        self.valve_open_count = str(value)
+        self.valve_phase = phase
+        if phase == "stable":
+            display_value = label if label is not None else value
+            self.valve_state_label = f"{display_value} keran stabil"
+        elif phase == "transition_close":
+            self.valve_state_label = "Transisi tutup cepat 4->0 keran"
+        elif phase == "transition_open":
+            self.valve_state_label = "Transisi buka cepat 0->4 keran"
+        else:
+            self.valve_state_label = "Transisi manual keran"
+        self.valve_marker_var.set(f"Keran: {self.valve_state_label}")
+        self.append_log(f"# Valve marker: {self.valve_state_label}")
+
+    def reset_valve_marker(self):
+        self.valve_open_count = "-"
+        self.valve_state_label = "Belum ditandai"
+        self.valve_phase = "unset"
+        self.valve_marker_var.set("Keran: belum ditandai")
+        self.append_log("# Valve marker reset")
 
     def refresh_ports(self):
         ports = [port.device for port in list_ports.comports()]
@@ -267,6 +383,7 @@ class App(tk.Tk):
         file_exists = path.exists() and path.stat().st_size > 0
         self.csv_file = path.open("a", newline="", encoding="utf-8")
         self.csv_writer = csv.writer(self.csv_file)
+        self.last_csv_log_time = 0.0
         if not file_exists:
             self.csv_writer.writerow(CSV_HEADER)
             self.csv_file.flush()
@@ -323,6 +440,9 @@ class App(tk.Tk):
                 "jsy_power_factor": 0.0,
                 "jsy_energy_kwh": 0.0,
                 "jsy_error_count": 0,
+                "valve_open_count": self.valve_open_count,
+                "valve_state_label": self.valve_state_label,
+                "valve_phase": self.valve_phase,
             }
             if len(parts) == 16:
                 row.update(
@@ -336,6 +456,7 @@ class App(tk.Tk):
                         "jsy_error_count": int(parts[15]),
                     }
                 )
+            self.apply_sensor_moving_average(row)
         except ValueError:
             self.status_var.set("DATA parse error")
             return
@@ -355,13 +476,20 @@ class App(tk.Tk):
         self.telemetry_vars["jsy_energy"].set(f'{row["jsy_energy_kwh"]:.3f} kWh')
         self.telemetry_vars["jsy_errors"].set(str(row["jsy_error_count"]))
 
-        if self.csv_writer is not None:
+        now = time.monotonic()
+        if self.csv_writer is not None and (now - self.last_csv_log_time) >= CSV_LOG_INTERVAL_SECONDS:
             try:
                 self.csv_writer.writerow([row[key] for key in CSV_HEADER])
                 self.csv_file.flush()
+                self.last_csv_log_time = now
             except OSError as exc:
                 self.append_log(f"! CSV write error: {exc}")
                 self.status_var.set("CSV write error")
+
+    def apply_sensor_moving_average(self, row):
+        for key, buffer in self.sensor_average_buffers.items():
+            buffer.append(row[key])
+            row[key] = sum(buffer) / len(buffer)
 
     def append_log(self, line):
         timestamp = time.strftime("%H:%M:%S")
